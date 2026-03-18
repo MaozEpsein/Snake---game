@@ -4,7 +4,6 @@
 // הרצה:
 //   iverilog -g2005 -o snake_sim.vvp clock_divider.v vga_controller.v snake_top.v snake_top_tb.v
 //   vvp snake_sim.vvp
-`timescale 1ns/1ps
 
 module snake_top_tb;
 

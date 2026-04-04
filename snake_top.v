@@ -5,7 +5,7 @@
 // Grid:  25 cols x 15 rows  (each cell = 32x32 px)
 //
 // Game states:
-//   ST_IDLE      - title screen "SNAKE" / "PRESS S1", wait for keypress
+//   ST_IDLE      - title screen + last/best score, press 5 to start
 //   ST_PLAYING   - active game
 //   ST_GAME_OVER - "GAME OVER" + flash red, press S1 to restart
 //
@@ -16,10 +16,10 @@
 //   Score  15+  ->  6 frames  (10  moves/sec)
 //
 // Colors:  Head = bright green  | Body = dark green
-//          Food = red           | Score = white (top-left overlay)
+//          Food = red           | HUD text = white (S/B/T at top-left)
 //          Game-over bg = flash red | Text = white
 //
-// Keypad:  UP=2  DOWN=8  LEFT=4  RIGHT=6  PAUSE=5 | S1=reset
+// Keypad:  UP=2  DOWN=8  LEFT=4  RIGHT=6  PAUSE=5  RESTART=D(hold) | S1=reset
 //
 // Body storage: circular buffer (MAX_LEN=64 segments)
 // Collision:    flat 375-bit presence map  body_map[row*25+col]
@@ -65,13 +65,14 @@ module snake_top (
     assign LCD_DEN  = de;
     assign LCD_VSYNC = vsync_int;
 
-    wire key_up, key_down, key_left, key_right, key_pause;
+    wire key_up, key_down, key_left, key_right, key_pause, key_restart;
     keypad_scanner u_keypad (
         .clk(clk_pixel), .reset(sys_reset),
         .row(KEY_ROW), .col(KEY_COL),
         .key_up(key_up), .key_down(key_down),
         .key_left(key_left), .key_right(key_right),
-        .key_pause(key_pause)
+        .key_pause(key_pause),
+        .key_restart(key_restart)
     );
 
     // =========================================================
@@ -91,6 +92,7 @@ module snake_top (
     localparam ST_IDLE      = 2'd0;
     localparam ST_PLAYING   = 2'd1;
     localparam ST_GAME_OVER = 2'd2;
+    localparam RESTART_HOLD_FRAMES = 7'd60;
 
     // =========================================================
     //  Cell-index: row*25 + col (0..374)
@@ -212,13 +214,22 @@ module snake_top (
     reg [1:0]  direction;
     reg [3:0]  frame_cnt;
     reg [7:0]  score;
+    reg [7:0]  last_score;
+    reg [7:0]  best_score = 8'd0;
     reg [4:0]  flash_cnt;
     reg        paused;
     reg        key_pause_prev;
+    reg [6:0]  restart_hold_cnt;
+    reg        restart_latched;
+    reg [5:0]  sec_frame_cnt;
+    reg [3:0]  time_m_tens;
+    reg [3:0]  time_m_ones;
+    reg [3:0]  time_s_tens;
+    reg [3:0]  time_s_ones;
 
     reg  vsync_d;
     wire frame_tick = ~vsync_d & vsync_int;
-    wire any_key    = key_up | key_down | key_left | key_right;
+    wire start_pressed = key_pause;
     wire pause_pressed = key_pause & ~key_pause_prev;
 
     // =========================================================
@@ -276,9 +287,17 @@ module snake_top (
             direction   <= DIR_RIGHT;
             frame_cnt   <= 4'd0;
             score       <= 8'd0;
+            last_score  <= 8'd0;
             flash_cnt   <= 5'd0;
             paused      <= 1'b0;
             key_pause_prev <= 1'b0;
+            restart_hold_cnt <= 7'd0;
+            restart_latched  <= 1'b0;
+            sec_frame_cnt <= 6'd0;
+            time_m_tens  <= 4'd0;
+            time_m_ones  <= 4'd0;
+            time_s_tens  <= 4'd0;
+            time_s_ones  <= 4'd0;
             lfsr        <= 16'hACE1;
             food_active <= 1'b1;
             food_col    <= 5'd20;
@@ -303,15 +322,64 @@ module snake_top (
                 flash_cnt <= flash_cnt + 5'd1;
                 key_pause_prev <= key_pause;
 
+                if (key_restart) begin
+                    if (restart_hold_cnt < RESTART_HOLD_FRAMES)
+                        restart_hold_cnt <= restart_hold_cnt + 7'd1;
+                end else begin
+                    restart_hold_cnt <= 7'd0;
+                    restart_latched  <= 1'b0;
+                end
+
+                if ((game_state != ST_IDLE) && key_restart && !restart_latched &&
+                    (restart_hold_cnt == RESTART_HOLD_FRAMES - 7'd1)) begin
+                    restart_latched  <= 1'b1;
+
+                    if (game_state == ST_PLAYING)
+                        last_score <= score;
+
+                    game_state  <= ST_IDLE;
+                    direction   <= DIR_RIGHT;
+                    frame_cnt   <= 4'd0;
+                    score       <= 8'd0;
+                    flash_cnt   <= 5'd0;
+                    paused      <= 1'b0;
+                    key_pause_prev <= 1'b0;
+                    sec_frame_cnt <= 6'd0;
+                    time_m_tens  <= 4'd0;
+                    time_m_ones  <= 4'd0;
+                    time_s_tens  <= 4'd0;
+                    time_s_ones  <= 4'd0;
+                    food_active <= 1'b1;
+                    food_col    <= 5'd20;
+                    food_row    <= 4'd7;
+
+                    head_ptr  <= 6'd0;
+                    snake_len <= 7'd3;
+                    body_col[0]  <= 5'd12;  body_row[0]  <= 4'd7;
+                    body_col[63] <= 5'd11;  body_row[63] <= 4'd7;
+                    body_col[62] <= 5'd10;  body_row[62] <= 4'd7;
+
+                    body_map      <= 375'b0;
+                    body_map[187] <= 1'b1;
+                    body_map[186]    <= 1'b1;
+                    body_map[185] <= 1'b1;
+                end else begin
+
                 case (game_state)
 
                     ST_IDLE: begin
                         paused <= 1'b0;
-                        if      (key_up)    direction <= DIR_UP;
-                        else if (key_down)  direction <= DIR_DOWN;
-                        else if (key_left)  direction <= DIR_LEFT;
-                        else if (key_right) direction <= DIR_RIGHT;
-                        if (any_key) game_state <= ST_PLAYING;
+                        if (start_pressed) begin
+                            game_state <= ST_PLAYING;
+                            direction  <= DIR_RIGHT;
+                            frame_cnt  <= 4'd0;
+                            score      <= 8'd0;
+                            sec_frame_cnt <= 6'd0;
+                            time_m_tens  <= 4'd0;
+                            time_m_ones  <= 4'd0;
+                            time_s_tens  <= 4'd0;
+                            time_s_ones  <= 4'd0;
+                        end
                     end
 
                     ST_PLAYING: begin
@@ -319,6 +387,30 @@ module snake_top (
                             paused <= ~paused;
 
                         if (!paused && !pause_pressed) begin
+                            // 60 frame ticks ~= 1 second at 60 Hz
+                            if (sec_frame_cnt == 6'd59) begin
+                                sec_frame_cnt <= 6'd0;
+                                if (time_s_ones == 4'd9) begin
+                                    time_s_ones <= 4'd0;
+                                    if (time_s_tens == 4'd5) begin
+                                        time_s_tens <= 4'd0;
+                                        if (time_m_ones == 4'd9) begin
+                                            time_m_ones <= 4'd0;
+                                            if (time_m_tens != 4'd9)
+                                                time_m_tens <= time_m_tens + 4'd1;
+                                        end else begin
+                                            time_m_ones <= time_m_ones + 4'd1;
+                                        end
+                                    end else begin
+                                        time_s_tens <= time_s_tens + 4'd1;
+                                    end
+                                end else begin
+                                    time_s_ones <= time_s_ones + 4'd1;
+                                end
+                            end else begin
+                                sec_frame_cnt <= sec_frame_cnt + 6'd1;
+                            end
+
                             if      (key_up    && direction != DIR_DOWN)  direction <= DIR_UP;
                             else if (key_down  && direction != DIR_UP)    direction <= DIR_DOWN;
                             else if (key_left  && direction != DIR_RIGHT) direction <= DIR_LEFT;
@@ -328,6 +420,7 @@ module snake_top (
                             if (frame_cnt == move_speed - 4'd1) begin
                                 frame_cnt <= 4'd0;
                                 if (hit_body) begin
+                                    last_score <= score;
                                     game_state <= ST_GAME_OVER;
                                     paused <= 1'b0;
                                 end else begin
@@ -338,6 +431,8 @@ module snake_top (
                                     if (eating_food) begin
                                         snake_len   <= snake_len + 7'd1;
                                         score       <= score + 8'd1;
+                                        if (score + 8'd1 > best_score)
+                                            best_score <= score + 8'd1;
                                         food_active <= 1'b0;
                                     end else begin
                                         if (tail_cidx != next_cidx)
@@ -359,6 +454,7 @@ module snake_top (
                     end
 
                 endcase
+                end
             end
         end
     end
@@ -381,41 +477,48 @@ module snake_top (
     wire is_food = food_active && (cur_col == food_col) && (cur_row == food_row);
     wire flash_on = flash_cnt[4];
 
-    // --- Score overlay (top-left, PLAYING + GAME_OVER) ---
-    wire [3:0] bcd_h = score / 8'd100;
-    wire [3:0] bcd_t = (score - bcd_h * 8'd100) / 8'd10;
-    wire [3:0] bcd_u =  score - bcd_h * 8'd100 - bcd_t * 8'd10;
+    // --- Compact HUD (top-left): S###  B###  TMM:SS ---
+    wire [3:0] sc_h = score / 8'd100;
+    wire [3:0] sc_t = (score - sc_h * 8'd100) / 8'd10;
+    wire [3:0] sc_u =  score - sc_h * 8'd100 - sc_t * 8'd10;
 
-    wire [34:0] bm_h = char_bitmap({2'b0, bcd_h});
-    wire [34:0] bm_t = char_bitmap({2'b0, bcd_t});
-    wire [34:0] bm_u = char_bitmap({2'b0, bcd_u});
+    wire [3:0] bs_h = best_score / 8'd100;
+    wire [3:0] bs_t = (best_score - bs_h * 8'd100) / 8'd10;
+    wire [3:0] bs_u =  best_score - bs_h * 8'd100 - bs_t * 8'd10;
 
-    wire in_score_y = de && (pixel_y >= 10'd8) && (pixel_y < 10'd22);
+    wire [3:0] ls_h = last_score / 8'd100;
+    wire [3:0] ls_t = (last_score - ls_h * 8'd100) / 8'd10;
+    wire [3:0] ls_u =  last_score - ls_h * 8'd100 - ls_t * 8'd10;
 
-    wire [9:0] rel_y  = pixel_y - 10'd8;
-    wire [2:0] fr     = rel_y[3:1];
+    wire hud_text_pixel = de && (game_state != ST_IDLE) && (
+        // S###
+        text_pix(pixel_x,pixel_y, 10'd8,   10'd8,  6'd28) ||
+        text_pix(pixel_x,pixel_y, 10'd20,  10'd8,  {2'b0, sc_h}) ||
+        text_pix(pixel_x,pixel_y, 10'd32,  10'd8,  {2'b0, sc_t}) ||
+        text_pix(pixel_x,pixel_y, 10'd44,  10'd8,  {2'b0, sc_u}) ||
 
-    wire in_dh = in_score_y && (pixel_x >= 10'd8)  && (pixel_x < 10'd18);
-    wire in_dt = in_score_y && (pixel_x >= 10'd20) && (pixel_x < 10'd30);
-    wire in_du = in_score_y && (pixel_x >= 10'd32) && (pixel_x < 10'd42);
+        // B###
+        text_pix(pixel_x,pixel_y, 10'd68,  10'd8,  6'd11) ||
+        text_pix(pixel_x,pixel_y, 10'd80,  10'd8,  {2'b0, bs_h}) ||
+        text_pix(pixel_x,pixel_y, 10'd92,  10'd8,  {2'b0, bs_t}) ||
+        text_pix(pixel_x,pixel_y, 10'd104, 10'd8,  {2'b0, bs_u}) ||
 
-    wire [9:0] rel_xh = pixel_x - 10'd8;
-    wire [9:0] rel_xt = pixel_x - 10'd20;
-    wire [9:0] rel_xu = pixel_x - 10'd32;
-    wire [2:0] fch    = rel_xh[3:1];
-    wire [2:0] fct    = rel_xt[3:1];
-    wire [2:0] fcu    = rel_xu[3:1];
+        // TMMSS
+        text_pix(pixel_x,pixel_y, 10'd140, 10'd8,  6'd29) ||
+        text_pix(pixel_x,pixel_y, 10'd152, 10'd8,  {2'b0, time_m_tens}) ||
+        text_pix(pixel_x,pixel_y, 10'd164, 10'd8,  {2'b0, time_m_ones}) ||
+        text_pix(pixel_x,pixel_y, 10'd184, 10'd8,  {2'b0, time_s_tens}) ||
+        text_pix(pixel_x,pixel_y, 10'd196, 10'd8,  {2'b0, time_s_ones})
+    );
 
-    wire [4:0] row_h = font_row_bits(bm_h, fr);
-    wire [4:0] row_t = font_row_bits(bm_t, fr);
-    wire [4:0] row_u = font_row_bits(bm_u, fr);
+    wire hud_colon_pixel = de && (game_state != ST_IDLE) &&
+        (pixel_x >= 10'd176) && (pixel_x < 10'd178) &&
+        (((pixel_y >= 10'd11) && (pixel_y < 10'd13)) ||
+         ((pixel_y >= 10'd17) && (pixel_y < 10'd19)));
 
-    wire score_pixel = (game_state != ST_IDLE) && (
-        (in_dh && row_h[4 - fch]) ||
-        (in_dt && row_t[4 - fct]) ||
-        (in_du && row_u[4 - fcu]));
+    wire score_pixel = hud_text_pixel || hud_colon_pixel;
 
-    // --- Title screen: "SNAKE" y=180, "PRESS S1" y=240 ---
+    // --- Title screen: "SNAKE" y=180, "PRESS 5" y=240, LAST/BEST below ---
     // Each char 10px wide x 14px tall (5x7 at scale 2), gap=2px
     // "SNAKE" 5 chars: width=58px, start_x=371
     // "PRESS S1" 8 chars: width=94px, start_x=353
@@ -425,13 +528,31 @@ module snake_top (
         text_pix(pixel_x,pixel_y, 10'd395,10'd180, 6'd10) ||  // A
         text_pix(pixel_x,pixel_y, 10'd407,10'd180, 6'd20) ||  // K
         text_pix(pixel_x,pixel_y, 10'd419,10'd180, 6'd14) ||  // E
-        text_pix(pixel_x,pixel_y, 10'd353,10'd240, 6'd25) ||  // P
-        text_pix(pixel_x,pixel_y, 10'd365,10'd240, 6'd27) ||  // R
-        text_pix(pixel_x,pixel_y, 10'd377,10'd240, 6'd14) ||  // E
-        text_pix(pixel_x,pixel_y, 10'd389,10'd240, 6'd28) ||  // S
-        text_pix(pixel_x,pixel_y, 10'd401,10'd240, 6'd28) ||  // S
-        text_pix(pixel_x,pixel_y, 10'd425,10'd240, 6'd28) ||  // S (space at 413)
-        text_pix(pixel_x,pixel_y, 10'd437,10'd240, 6'd1));     // 1
+        text_pix(pixel_x,pixel_y, 10'd359,10'd240, 6'd25) ||  // P
+        text_pix(pixel_x,pixel_y, 10'd371,10'd240, 6'd27) ||  // R
+        text_pix(pixel_x,pixel_y, 10'd383,10'd240, 6'd14) ||  // E
+        text_pix(pixel_x,pixel_y, 10'd395,10'd240, 6'd28) ||  // S
+        text_pix(pixel_x,pixel_y, 10'd407,10'd240, 6'd28) ||  // S
+        text_pix(pixel_x,pixel_y, 10'd431,10'd240, {2'b0,4'd5}) || // 5 (space at 419)
+
+        // LAST ###
+        text_pix(pixel_x,pixel_y, 10'd329,10'd300, 6'd21) ||  // L
+        text_pix(pixel_x,pixel_y, 10'd341,10'd300, 6'd10) ||  // A
+        text_pix(pixel_x,pixel_y, 10'd353,10'd300, 6'd28) ||  // S
+        text_pix(pixel_x,pixel_y, 10'd365,10'd300, 6'd29) ||  // T
+        text_pix(pixel_x,pixel_y, 10'd389,10'd300, {2'b0, ls_h}) ||
+        text_pix(pixel_x,pixel_y, 10'd401,10'd300, {2'b0, ls_t}) ||
+        text_pix(pixel_x,pixel_y, 10'd413,10'd300, {2'b0, ls_u}) ||
+
+        // BEST ###
+        text_pix(pixel_x,pixel_y, 10'd329,10'd324, 6'd11) ||  // B
+        text_pix(pixel_x,pixel_y, 10'd341,10'd324, 6'd14) ||  // E
+        text_pix(pixel_x,pixel_y, 10'd353,10'd324, 6'd28) ||  // S
+        text_pix(pixel_x,pixel_y, 10'd365,10'd324, 6'd29) ||  // T
+        text_pix(pixel_x,pixel_y, 10'd389,10'd324, {2'b0, bs_h}) ||
+        text_pix(pixel_x,pixel_y, 10'd401,10'd324, {2'b0, bs_t}) ||
+        text_pix(pixel_x,pixel_y, 10'd413,10'd324, {2'b0, bs_u})
+    );
 
     // --- Game over: "GAME OVER" centered y=220 ---
     // 9 chars: width=106px, start_x=347

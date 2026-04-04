@@ -1,13 +1,15 @@
 // Testbench - Snake Game (Tang Nano 9K + Sipeed 7-inch LCD 800x480)
 //
 // Phase 1 - ST_IDLE:       white title text, no green pixels
-// Phase 2 - ST_PLAYING:    head green, food red, score white, no bad pixels
-// Phase 3 - Movement:      head position changes after one forced game move
-// Phase 4 - U-turn block:  pressing opposite direction does not reverse snake
-// Phase 5 - Pause/Resume:  key "5" toggles paused, freezes and resumes movement
-// Phase 6 - Game Over:     hit_body=1 -> transitions to ST_GAME_OVER
-// Phase 7 - GO visuals:    red/dark-red background + GAME OVER text, no green
-// Phase 8 - Reset:         S1 returns to ST_IDLE, title visible
+// Phase 2 - Idle start gate: only key "5" starts, arrows must not start
+// Phase 3 - ST_PLAYING:    head green, food red, score/HUD visible, no bad pixels
+// Phase 4 - Movement:      head position changes after one forced game move
+// Phase 5 - U-turn block:  pressing opposite direction does not reverse snake
+// Phase 6 - Pause/Resume:  key "5" toggles paused, freezes and resumes movement
+// Phase 7 - Restart (D):   short press ignored, long press (~1s) restarts game
+// Phase 8 - Game Over:     hit_body=1 -> transitions to ST_GAME_OVER + LAST score latched
+// Phase 9 - GO visuals:    red/dark-red background + GAME OVER text, no green
+// Phase 10 - Reset:        S1 returns to ST_IDLE, title visible
 //
 // Acceleration technique (Phases 3, 4):
 //   Instead of waiting 15 frames for a game move, force dut.frame_cnt = 14
@@ -122,15 +124,44 @@ module snake_top_tb;
 
         reset_counters;
 
-        // ---- Phase 2: press UP key -> ST_PLAYING ----
-        // Must hold for at least one full frame so frame_tick sees any_key=1
-        KEY_COL = 4'b0010;            // COL1=1 -> key "2" (UP)
-        #(ONE_FRAME + ONE_FRAME / 2); // hold 1.5 frames to guarantee frame_tick sees it
-        KEY_COL = 4'b0000;
-        reset_counters;               // start counting only after key released
+        // ---- Phase 2: Idle start gate (only key 5 starts) ----
+        $display("--- Phase 2: Idle start gate ---");
+        force dut.key_up = 1'b1;
+        repeat (2) @(posedge dut.frame_tick);
+        release dut.key_up;
+        @(posedge dut.frame_tick);
+        if (dut.game_state == 2'd0)
+            $display("PASS: Arrow key does not start from IDLE");
+        else
+            $display("FAIL: Arrow key started game from IDLE (state=%0d)", dut.game_state);
+
+        force dut.key_pause = 1'b1; // key "5"
+        repeat (2) @(posedge dut.frame_tick);
+        release dut.key_pause;
+        @(posedge dut.frame_tick);
+        if (dut.game_state == 2'd1)
+            $display("PASS: Key 5 starts game from IDLE");
+        else
+            $display("FAIL: Key 5 did not start game (state=%0d)", dut.game_state);
+
+        // Ensure BEST has a non-zero known value via one forced "eat" event
+        force dut.eating_food = 1'b1;
+        force dut.hit_body    = 1'b0;
+        force dut.frame_cnt   = 4'd14;
+        @(posedge dut.frame_tick);
+        #60;
+        release dut.eating_food;
+        release dut.hit_body;
+        release dut.frame_cnt;
+        if (dut.best_score > 8'd0)
+            $display("PASS: BEST updates during play");
+        else
+            $display("FAIL: BEST did not update");
+
+        reset_counters;
         #(2 * ONE_FRAME);
 
-        $display("--- Phase 2: ST_PLAYING ---");
+        $display("--- Phase 3: ST_PLAYING ---");
         $display("Green  : %0d (expect ~1800 head pixels)", green_pixels);
         $display("Red    : %0d (expect >0 food)", red_pixels);
         $display("White  : %0d (expect >0 score)", white_pixels);
@@ -156,10 +187,10 @@ module snake_top_tb;
         else
             $display("FAIL: %0d pixels outside DE", bad_pixels);
 
-        // ---- Phase 3: Snake movement ----
+        // ---- Phase 4: Snake movement ----
         // Force frame_cnt -> move fires on next frame_tick (no 15-frame wait).
         // Snake is going UP: head_row must decrease by 1.
-        $display("--- Phase 3: Snake movement ---");
+        $display("--- Phase 4: Snake movement ---");
         begin : phase3
             reg [4:0] pre_col;
             reg [3:0] pre_row;
@@ -181,10 +212,10 @@ module snake_top_tb;
                 $display("FAIL: Head pixels wrong after move - got %0d", green_pixels);
         end
 
-        // ---- Phase 4: U-turn prevention ----
+        // ---- Phase 5: U-turn prevention ----
         // Direction is UP. Force key_down=1 (opposite) for one frame, then
         // trigger a move and verify the row still decreased (snake kept going UP).
-        $display("--- Phase 4: U-turn prevention ---");
+        $display("--- Phase 5: U-turn prevention ---");
         begin : phase4
             reg [3:0] pre_row4;
             pre_row4 = dut.head_row;
@@ -204,13 +235,17 @@ module snake_top_tb;
                 $display("FAIL: U-turn NOT blocked (row %0d -> %0d)", pre_row4, dut.head_row);
         end
 
-        // ---- Phase 5: Pause/Resume (key 5) ----
-        $display("--- Phase 5: Pause/Resume (key 5) ---");
+        // ---- Phase 6: Pause/Resume (key 5) ----
+        $display("--- Phase 6: Pause/Resume (key 5) ---");
         begin : phase5
             reg [4:0] pre_col5;
             reg [3:0] pre_row5;
             reg [4:0] paused_col5;
             reg [3:0] paused_row5;
+
+            // Ensure a clean low level first, then create a rising edge
+            force dut.key_pause = 1'b0;
+            @(posedge dut.frame_tick);
 
             // Toggle pause ON
             force dut.key_pause = 1'b1;
@@ -235,6 +270,10 @@ module snake_top_tb;
                 $display("FAIL: Snake moved during pause (%0d,%0d)->(%0d,%0d)",
                          pre_col5, pre_row5, paused_col5, paused_row5);
 
+            // Ensure a clean low level first, then create a rising edge
+            force dut.key_pause = 1'b0;
+            @(posedge dut.frame_tick);
+
             // Toggle pause OFF
             force dut.key_pause = 1'b1;
             @(posedge dut.frame_tick);
@@ -256,14 +295,67 @@ module snake_top_tb;
                 $display("FAIL: Snake still frozen after resume");
         end
 
-        // ---- Phase 6: Self-collision -> Game Over ----
+        // ---- Phase 7: Restart by D long-press ----
+        $display("--- Phase 7: Restart by D long-press ---");
+        begin : phase6
+            // Short press: should NOT restart
+            force dut.key_restart = 1'b1;
+            repeat (3) @(posedge dut.frame_tick);
+            release dut.key_restart;
+            @(posedge dut.frame_tick);
+            if (dut.game_state == 2'd1 && dut.restart_latched == 1'b0)
+                $display("PASS: Short D press ignored");
+            else
+                $display("FAIL: Short D press triggered restart (state=%0d)", dut.game_state);
+
+            // Long-press behavior (optimized): pre-load counter near threshold,
+            // then hold D for 2 frame ticks to cross the restart trigger point.
+            force dut.restart_hold_cnt = 7'd58;
+            force dut.key_restart = 1'b1;
+            repeat (2) @(posedge dut.frame_tick);
+            release dut.key_restart;
+            release dut.restart_hold_cnt;
+            #100;
+
+            if (dut.game_state == 2'd0)
+                $display("PASS: Long D press restarted to ST_IDLE");
+            else
+                $display("FAIL: Long D press did not restart (state=%0d)", dut.game_state);
+
+            if (dut.score == 8'd0 && dut.snake_len == 7'd3 && dut.paused == 1'b0)
+                $display("PASS: Restart reset core game state");
+            else
+                $display("FAIL: Restart state wrong (score=%0d len=%0d paused=%0d)",
+                         dut.score, dut.snake_len, dut.paused);
+
+            // Re-enter PLAYING quickly with key 5 so following phases remain valid
+            force dut.key_pause = 1'b1;
+            @(posedge dut.frame_tick);
+            #1;
+            release dut.key_pause;
+            @(posedge dut.frame_tick);
+            if (dut.game_state == 2'd1)
+                $display("PASS: Re-entered ST_PLAYING after restart");
+            else
+                $display("FAIL: Could not re-enter ST_PLAYING (state=%0d)", dut.game_state);
+
+            if (dut.score == 8'd0 && dut.best_score > 8'd0)
+                $display("PASS: New game resets SCORE and keeps BEST");
+            else
+                $display("FAIL: SCORE/BEST after restart-start wrong (score=%0d best=%0d)",
+                         dut.score, dut.best_score);
+        end
+
+        // ---- Phase 8: Self-collision -> Game Over ----
         // hit_body is only evaluated when frame_tick AND frame_cnt==move_speed-1.
         // Force both so the collision check fires on the very next frame_tick.
-        $display("--- Phase 6: Self-collision -> Game Over ---");
+        $display("--- Phase 8: Self-collision -> Game Over ---");
+        force dut.score = 8'd7;
         force dut.hit_body  = 1'b1;
         force dut.frame_cnt = 4'd14;
         @(posedge dut.frame_tick);
         #60;
+        release dut.score;
         release dut.hit_body;
         release dut.frame_cnt;
         #100;
@@ -272,12 +364,17 @@ module snake_top_tb;
         else
             $display("FAIL: game_state=%0d (expected 2=ST_GAME_OVER)", dut.game_state);
 
-        // ---- Phase 7: Game Over visuals ----
+        if (dut.last_score == 8'd7)
+            $display("PASS: LAST score latched on game over");
+        else
+            $display("FAIL: LAST score wrong (last=%0d expected=7)", dut.last_score);
+
+        // ---- Phase 9: Game Over visuals ----
         // anyred_pixels covers both flash states (bright R=11111 and dark R=00110).
         // Expect: anyred > 0, GAME OVER text (white > 0), no green, no bad pixels.
         reset_counters;
         #(2 * ONE_FRAME);
-        $display("--- Phase 7: Game Over visuals ---");
+        $display("--- Phase 9: Game Over visuals ---");
         $display("AnyRed : %0d (expect >0 flash bg)", anyred_pixels);
         $display("White  : %0d (expect >0 GAME OVER text)", white_pixels);
         $display("Green  : %0d (expect 0)", green_pixels);
@@ -303,8 +400,8 @@ module snake_top_tb;
         else
             $display("FAIL: %0d pixels outside DE in Game Over", bad_pixels);
 
-        // ---- Phase 8: Reset from Game Over -> ST_IDLE ----
-        $display("--- Phase 8: Reset from Game Over ---");
+        // ---- Phase 10: Reset from Game Over -> ST_IDLE ----
+        $display("--- Phase 10: Reset from Game Over ---");
         reset_btn = 1'b0;  // S1 active-low: assert reset
         #200;
         reset_btn = 1'b1;

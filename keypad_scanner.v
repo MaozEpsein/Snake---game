@@ -14,6 +14,7 @@
 //   PAUSE = key "5" -> ROW[1], COL[1]
 //   RIGHT = key "6" -> ROW[1], COL[2]
 //   DOWN  = key "8" -> ROW[2], COL[1]
+//   RESTART = key "D" -> ROW[3], COL[3]
 //
 // row[3:0] -> pins 66,65,64,63 (FPGA output)
 // col[3:0] -> pins 82,81,80,79 (FPGA input, PULL_DOWN in CST)
@@ -31,7 +32,8 @@ module keypad_scanner (
     output reg        key_down,
     output reg        key_left,
     output reg        key_right,
-    output reg        key_pause
+    output reg        key_pause,
+    output reg        key_restart
 );
     // 33 MHz / 2^15 = ~1007 Hz per row  ->  ~252 Hz full scan
     reg [14:0] scan_timer;
@@ -83,12 +85,14 @@ module keypad_scanner (
             key_left  <= 1'b0;
             key_right <= 1'b0;
             key_pause <= 1'b0;
+            key_restart <= 1'b0;
         end else begin
             key_up    <= col_r0[1];  // ROW0, COL1 = "2"
             key_down  <= col_r2[1];  // ROW2, COL1 = "8"
             key_left  <= col_r1[0];  // ROW1, COL0 = "4"
             key_right <= col_r1[2];  // ROW1, COL2 = "6"
             key_pause <= col_r1[1];  // ROW1, COL1 = "5"
+            key_restart <= col_r3[3]; // ROW3, COL3 = "D"
         end
     end
 

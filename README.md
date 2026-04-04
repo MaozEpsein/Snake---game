@@ -40,7 +40,7 @@ Keypad layout:
 ROW0:   1     2     3     A       2 = UP
 ROW1:   4     5     6     B       4 = LEFT    5 = PAUSE    6 = RIGHT
 ROW2:   7     8     9     C       8 = DOWN
-ROW3:   *     0     #     D
+ROW3:   *     0     #     D       Hold D (~1s) = RESTART
 ```
 
 | Key | Action |
@@ -50,6 +50,8 @@ ROW3:   *     0     #     D
 | **4** | Move left |
 | **6** | Move right |
 | **5** | Pause / Resume |
+| **5 (from title screen)** | Start game |
+| **D (hold ~1s)** | Restart game |
 | **S1 (reset)** | Restart game |
 
 180 U-turns are blocked (you cannot reverse into yourself in a single move).
@@ -60,8 +62,8 @@ ROW3:   *     0     #     D
 
 | State | Description |
 |---|---|
-| **ST_IDLE** | Title screen: "SNAKE" + "PRESS S1". Press any arrow key to start. |
-| **ST_PLAYING** | Active game. Score displayed top-left. Speed increases with score. |
+| **ST_IDLE** | Title screen: "SNAKE" + "PRESS 5" + `LAST` (last game score) + `BEST` (best score so far this power session). |
+| **ST_PLAYING** | Active game. Compact HUD top-left: **S**(score), **B**(best in current power session), **T**(elapsed time MM:SS). Speed increases with score. |
 | **ST_GAME_OVER** | Red flashing screen + "GAME OVER" text. Press S1 to restart. |
 
 ---
@@ -77,6 +79,11 @@ ROW3:   *     0     #     D
 | Dark blue | Idle background |
 | Flashing red | Game over background |
 | White | Text (title / score / game over) |
+
+HUD note:
+- `S` = current score
+- `B` = best score while board is powered on
+- `T` = elapsed game time (`MM:SS`) for the current round
 
 Each grid cell is 32x32 pixels with a 1-pixel black border, giving a 30x30 pixel visible core.
 
@@ -180,18 +187,75 @@ vvp snake_sim.vvp
 gtkwave snake_top_tb.vcd
 ```
 
-Expected output:
+Sample output (all phases, shortened checks per phase):
 ```
 --- Phase 1: ST_IDLE ---
 PASS: VSYNC timing OK
 PASS: Title text visible
 PASS: No game pixels in IDLE
---- Phase 2: ST_PLAYING ---
+--- Phase 2: Idle start gate ---
+PASS: Arrow key does not start from IDLE
+PASS: Key 5 starts game from IDLE
+PASS: BEST updates during play
+--- Phase 3: ST_PLAYING ---
 PASS: Head pixel count OK
 PASS: Food rendered
 PASS: Score overlay rendered
 PASS: No pixels outside DE
+--- Phase 4: Snake movement ---
+PASS: Snake moved UP
+PASS: Head pixels OK after move
+--- Phase 5: U-turn prevention ---
+PASS: U-turn blocked, snake still moving UP
+--- Phase 6: Pause/Resume (key 5) ---
+PASS: Pause toggled ON
+PASS: Snake frozen during pause
+PASS: Pause toggled OFF (resume)
+PASS: Snake moves after resume
+--- Phase 7: Restart by D long-press ---
+PASS: Short D press ignored
+PASS: Long D press restarted to ST_IDLE
+PASS: Restart reset core game state
+PASS: Re-entered ST_PLAYING after restart
+PASS: New game resets SCORE and keeps BEST
+--- Phase 8: Self-collision -> Game Over ---
+PASS: Transitioned to ST_GAME_OVER
+PASS: LAST score latched on game over
+--- Phase 9: Game Over visuals ---
+PASS: Red flash background visible
+PASS: GAME OVER text visible
+PASS: No snake pixels in Game Over
+PASS: No pixels outside DE in Game Over
+--- Phase 10: Reset from Game Over ---
+PASS: Back to ST_IDLE after reset
+PASS: Title screen visible after reset
+PASS: No game pixels after reset
 ```
+
+### Testbench Coverage (`snake_top_tb.v`)
+
+The simulation testbench is organized into 10 phases:
+
+| Phase | What is tested |
+|---|---|
+| **1. ST_IDLE** | VSYNC/frame activity, title text visibility, and no snake/game pixels in idle screen. |
+| **2. Idle start gate** | Only key **5** starts the game from idle; arrow keys must not start. Also checks `BEST` can update during play setup. |
+| **3. ST_PLAYING** | Head pixels, food rendering, HUD/text rendering, and no active RGB output outside DE. |
+| **4. Movement** | Snake head position changes after one game move tick. |
+| **5. U-turn prevention** | Opposite-direction input does not reverse movement in one step. |
+| **6. Pause/Resume (key 5)** | Pause toggles on, snake freezes while paused, pause toggles off, movement resumes. |
+| **7. Restart by D long-press** | Short D press is ignored, long D press restarts to idle, and next start resets SCORE while keeping BEST. |
+| **8. Self-collision -> Game Over** | Forced body hit transitions to `ST_GAME_OVER`; `LAST` score is latched. |
+| **9. Game Over visuals** | Red flashing background and GAME OVER text are visible; no snake pixels; no pixels outside DE. |
+| **10. Reset from Game Over** | S1 reset returns to `ST_IDLE` and title screen appears with no gameplay pixels. |
+
+Pass/fail rule:
+- A run is considered good only when all checks print `PASS:` and no `FAIL:` lines appear.
+- If any `FAIL:` appears, inspect that phase first, then open waveforms in GTKWave for signal-level debugging.
+
+Runtime notes:
+- The testbench uses acceleration techniques (forcing some internal counters/signals) to keep runtime short while still checking full state flow.
+- Output logs can be redirected (for CI or local review), for example: `vvp snake_sim.vvp > tb_full_run.log`.
 
 ### FPGA Synthesis (Gowin IDE)
 

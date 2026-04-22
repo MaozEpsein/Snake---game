@@ -75,6 +75,7 @@ ROW3:   *     0     #     D       Hold D (~1s) = RESTART
 | Bright green | Snake head |
 | Dark green | Snake body |
 | Red | Food |
+| Orange | Temporary obstacle |
 | Black | Empty cell / cell border |
 | Dark blue | Idle background |
 | Flashing red | Game over background |
@@ -86,6 +87,15 @@ HUD note:
 - `T` = elapsed game time (`MM:SS`) for the current round
 
 Each grid cell is 32x32 pixels with a 1-pixel black border, giving a 30x30 pixel visible core.
+
+Obstacle note (stage-2 + stage-3):
+- Obstacles appear over time during gameplay and disappear after a limited lifetime.
+- Maximum active obstacle count increases with score progression.
+- Obstacle shape grows with snake length and can be rectangular (not only square).
+- New obstacles are never spawned on snake cells, food cells, existing obstacles, or near the snake head (dynamic safety radius).
+- Stage-3 difficulty now ramps by both score and survival time (not score alone).
+- Stage-3 spawn logic tries multiple candidate positions per spawn window to reduce dry periods.
+- Hitting an obstacle causes immediate game over.
 
 ---
 
@@ -168,6 +178,34 @@ Advances every pixel clock (~33M times/sec). Food placed when `food_active=0` an
 | 10-14 | 9 | 6.7 |
 | 15+ | 6 | 10.0 |
 
+### Dynamic Obstacles (Stage-2 + Stage-3)
+
+| Progress | Spawn period | Max active obstacles |
+|---|---:|---:|
+| Score 0-4 | ~5.0 sec | 1 |
+| Score 5-9 | ~4.0 sec | 2 |
+| Score 10-14 | ~3.0 sec | 3 |
+| Score 15+ | ~2.0 sec | 4 |
+
+Stage-3 pressure model:
+- Internal difficulty tier also advances with survival time (frame count), even if score stalls.
+- At higher tiers, spawn period shortens, lifetime tightens, and max active obstacles increases.
+- Each spawn event checks up to 3 candidate locations before skipping, improving consistency.
+
+| Snake length | Obstacle shape profile |
+|---|---|
+| < 10 | 1x1 |
+| 10-17 | 2x1 or 1x2 |
+| 18+ | 2x2, 3x1, 1x3, 3x2 |
+
+Obstacle lifetime:
+- Score < 10: randomized in a bounded range (~3.7-6.0 sec)
+- Score >= 10: randomized in a bounded range (~3.0-5.0 sec)
+
+Fairness rules:
+- Grace window at round start: no obstacle spawns for ~2 sec.
+- Head safety radius is larger early and tightens later (still protected around head).
+
 ### Character Font
 
 5x7 pixel bitmaps (35-bit constants). Full set: digits 0-9 and letters A-Z.
@@ -230,11 +268,20 @@ PASS: No pixels outside DE in Game Over
 PASS: Back to ST_IDLE after reset
 PASS: Title screen visible after reset
 PASS: No game pixels after reset
+--- Phase 11: Obstacle spawn ---
+PASS: Obstacle spawns and map updates
+--- Phase 12: Head safety radius ---
+PASS: Near-head spawn blocked by safety radius
+PASS: Farther spawn allowed outside safety radius
+--- Phase 13: Obstacle TTL expiry ---
+PASS: Obstacle expired and map cleared
+--- Phase 14: Obstacle collision -> Game Over ---
+PASS: Obstacle hit transitions to ST_GAME_OVER
 ```
 
 ### Testbench Coverage (`snake_top_tb.v`)
 
-The simulation testbench is organized into 10 phases:
+The simulation testbench is organized into 14 phases:
 
 | Phase | What is tested |
 |---|---|
@@ -248,6 +295,10 @@ The simulation testbench is organized into 10 phases:
 | **8. Self-collision -> Game Over** | Forced body hit transitions to `ST_GAME_OVER`; `LAST` score is latched. |
 | **9. Game Over visuals** | Red flashing background and GAME OVER text are visible; no snake pixels; no pixels outside DE. |
 | **10. Reset from Game Over** | S1 reset returns to `ST_IDLE` and title screen appears with no gameplay pixels. |
+| **11. Obstacle spawn** | Forces spawn window/counter and verifies obstacle instances appear in `obstacle_map`. |
+| **12. Head safety radius** | Verifies near-head candidate spawn is rejected and a farther candidate is accepted. |
+| **13. Obstacle TTL expiry** | Forces short TTL and checks slot deactivation plus map cleanup when obstacle expires. |
+| **14. Obstacle collision -> Game Over** | Places an obstacle in the next movement cell and checks immediate game-over transition. |
 
 Pass/fail rule:
 - A run is considered good only when all checks print `PASS:` and no `FAIL:` lines appear.

@@ -83,6 +83,7 @@ module snake_top (
     localparam GRID_ROWS = 15;
     localparam BORDER    = 1;
     localparam MAX_LEN   = 64;
+    localparam MAX_OBS   = 8;
 
     localparam DIR_RIGHT = 2'd0;
     localparam DIR_LEFT  = 2'd1;
@@ -92,7 +93,13 @@ module snake_top (
     localparam ST_IDLE      = 2'd0;
     localparam ST_PLAYING   = 2'd1;
     localparam ST_GAME_OVER = 2'd2;
-    localparam RESTART_HOLD_FRAMES = 7'd60;
+`ifdef SIMULATION
+    localparam RESTART_HOLD_FRAMES    = 7'd5;
+    localparam OBSTACLE_GRACE_FRAMES  = 9'd10;
+`else
+    localparam RESTART_HOLD_FRAMES    = 7'd60;
+    localparam OBSTACLE_GRACE_FRAMES  = 9'd120;
+`endif
 
     // =========================================================
     //  Cell-index: row*25 + col (0..374)
@@ -101,6 +108,22 @@ module snake_top (
         input [3:0] r;
         input [4:0] c;
         cidx = ({5'b0,r} << 4) + ({5'b0,r} << 3) + {5'b0,r} + {4'b0,c};
+    endfunction
+
+    function [4:0] abs5;
+        input [4:0] a;
+        input [4:0] b;
+        begin
+            abs5 = (a >= b) ? (a - b) : (b - a);
+        end
+    endfunction
+
+    function [3:0] abs4;
+        input [3:0] a;
+        input [3:0] b;
+        begin
+            abs4 = (a >= b) ? (a - b) : (b - a);
+        end
     endfunction
 
     // =========================================================
@@ -206,6 +229,36 @@ module snake_top (
     //  Body Presence Map (375 bits)
     // =========================================================
     reg [374:0] body_map;
+    reg [374:0] obstacle_map;
+
+    // Dynamic temporary obstacles (stage-1)
+    reg [MAX_OBS-1:0] obs_active;
+    reg [4:0] obs_col [0:MAX_OBS-1];
+    reg [3:0] obs_row [0:MAX_OBS-1];
+    reg [1:0] obs_w [0:MAX_OBS-1];
+    reg [1:0] obs_h [0:MAX_OBS-1];
+    reg [8:0] obs_ttl [0:MAX_OBS-1];
+    reg [8:0] obstacle_spawn_cnt;
+    reg [3:0] obstacle_count;
+
+    integer oi;
+    integer oj;
+    integer ok;
+    integer slot_idx;
+    reg slot_found;
+    reg spawn_valid;
+    reg [1:0] spawn_w;
+    reg [1:0] spawn_h;
+    reg [4:0] spawn_col;
+    reg [3:0] spawn_row;
+    reg [8:0] spawn_ttl;
+    reg [5:0] spawn_ttl_rand;
+    integer expire_count;
+    reg [8:0] play_frame_cnt;
+    reg [2:0] obstacle_level;
+    integer spawn_try;
+    reg [4:0] try_col;
+    reg [3:0] try_row;
 
     // =========================================================
     //  Game State
@@ -237,11 +290,45 @@ module snake_top (
     // =========================================================
     reg [3:0] move_speed;
     always @(*) begin
+`ifdef SIMULATION
+        // In simulation every VGA frame already takes ~554 K clocks to
+        // render, so move the snake every single frame for playable speed.
+        move_speed = 4'd1;
+`else
         if      (score >= 8'd15) move_speed = 4'd6;
         else if (score >= 8'd10) move_speed = 4'd9;
         else if (score >= 8'd5)  move_speed = 4'd12;
         else                     move_speed = 4'd15;
+`endif
     end
+
+    always @(*) begin
+        // Stage-3 difficulty tiering: ramps by both score and survival time.
+        if      ((score >= 8'd15) || (play_frame_cnt >= 9'd420)) obstacle_level = 3'd3;
+        else if ((score >= 8'd10) || (play_frame_cnt >= 9'd300)) obstacle_level = 3'd2;
+        else if ((score >= 8'd5)  || (play_frame_cnt >= 9'd180)) obstacle_level = 3'd1;
+        else                                                    obstacle_level = 3'd0;
+    end
+
+    wire [3:0] obstacle_target = (obstacle_level == 3'd3) ? 4'd5 :
+                                 (obstacle_level == 3'd2) ? 4'd3 :
+                                 (obstacle_level == 3'd1) ? 4'd2 : 4'd1;
+
+    wire [8:0] obstacle_spawn_period = (obstacle_level == 3'd3) ? 9'd80  :
+                                       (obstacle_level == 3'd2) ? 9'd130 :
+                                       (obstacle_level == 3'd1) ? 9'd190 : 9'd260;
+
+    wire [8:0] obstacle_lifetime_min = (obstacle_level == 3'd3) ? 9'd150 :
+                                       (obstacle_level == 3'd2) ? 9'd170 :
+                                       (obstacle_level == 3'd1) ? 9'd200 : 9'd230;
+    wire [8:0] obstacle_lifetime_max = (obstacle_level == 3'd3) ? 9'd240 :
+                                       (obstacle_level == 3'd2) ? 9'd280 :
+                                       (obstacle_level == 3'd1) ? 9'd320 : 9'd360;
+
+    wire [4:0] spawn_col_raw = lfsr[9:5];
+    wire [3:0] spawn_row_raw = lfsr[13:10];
+    wire [2:0] head_safe_cells = (obstacle_level == 3'd3) ? 3'd2 :
+                                 (obstacle_level >= 3'd1) ? 3'd3 : 3'd4;
 
     // =========================================================
     //  Food
@@ -276,6 +363,7 @@ module snake_top (
     wire eating_food = food_active && (next_col == food_col) && (next_row == food_row);
     wire hit_body    = body_map[next_cidx] &&
                        (eating_food || (next_cidx != tail_cidx));
+    wire hit_obstacle = obstacle_map[next_cidx];
 
     // =========================================================
     //  Game Logic (sequential)
@@ -298,6 +386,7 @@ module snake_top (
             time_m_ones  <= 4'd0;
             time_s_tens  <= 4'd0;
             time_s_ones  <= 4'd0;
+            play_frame_cnt <= 9'd0;
             lfsr        <= 16'hACE1;
             food_active <= 1'b1;
             food_col    <= 5'd20;
@@ -313,6 +402,18 @@ module snake_top (
             body_map[187] <= 1'b1;   // cidx(7,12)
             body_map[186] <= 1'b1;   // cidx(7,11)
             body_map[185] <= 1'b1;   // cidx(7,10)
+
+            obstacle_map <= 375'b0;
+            obs_active <= {MAX_OBS{1'b0}};
+            obstacle_spawn_cnt <= 9'd0;
+            obstacle_count <= 4'd0;
+            for (oi = 0; oi < MAX_OBS; oi = oi + 1) begin
+                obs_col[oi]  <= 5'd0;
+                obs_row[oi]  <= 4'd0;
+                obs_w[oi]    <= 2'd1;
+                obs_h[oi]    <= 2'd1;
+                obs_ttl[oi]  <= 9'd0;
+            end
 
         end else begin
             lfsr    <= lfsr_next;
@@ -349,6 +450,7 @@ module snake_top (
                     time_m_ones  <= 4'd0;
                     time_s_tens  <= 4'd0;
                     time_s_ones  <= 4'd0;
+                    play_frame_cnt <= 9'd0;
                     food_active <= 1'b1;
                     food_col    <= 5'd20;
                     food_row    <= 4'd7;
@@ -363,6 +465,17 @@ module snake_top (
                     body_map[187] <= 1'b1;
                     body_map[186]    <= 1'b1;
                     body_map[185] <= 1'b1;
+                    obstacle_map <= 375'b0;
+                    obs_active <= {MAX_OBS{1'b0}};
+                    obstacle_spawn_cnt <= 9'd0;
+                    obstacle_count <= 4'd0;
+                    for (oi = 0; oi < MAX_OBS; oi = oi + 1) begin
+                        obs_col[oi]  <= 5'd0;
+                        obs_row[oi]  <= 4'd0;
+                        obs_w[oi]    <= 2'd1;
+                        obs_h[oi]    <= 2'd1;
+                        obs_ttl[oi]  <= 9'd0;
+                    end
                 end else begin
 
                 case (game_state)
@@ -379,6 +492,18 @@ module snake_top (
                             time_m_ones  <= 4'd0;
                             time_s_tens  <= 4'd0;
                             time_s_ones  <= 4'd0;
+                            play_frame_cnt <= 9'd0;
+                            obstacle_map <= 375'b0;
+                            obs_active <= {MAX_OBS{1'b0}};
+                            obstacle_spawn_cnt <= 9'd0;
+                            obstacle_count <= 4'd0;
+                            for (oi = 0; oi < MAX_OBS; oi = oi + 1) begin
+                                obs_col[oi]  <= 5'd0;
+                                obs_row[oi]  <= 4'd0;
+                                obs_w[oi]    <= 2'd1;
+                                obs_h[oi]    <= 2'd1;
+                                obs_ttl[oi]  <= 9'd0;
+                            end
                         end
                     end
 
@@ -387,6 +512,140 @@ module snake_top (
                             paused <= ~paused;
 
                         if (!paused && !pause_pressed) begin
+                            if (play_frame_cnt < 9'd511)
+                                play_frame_cnt <= play_frame_cnt + 9'd1;
+
+                            // Decrement obstacle lifetimes and clear expired shapes from map.
+                            expire_count = 0;
+                            for (oi = 0; oi < MAX_OBS; oi = oi + 1) begin
+                                if (obs_active[oi]) begin
+                                    if (obs_ttl[oi] > 9'd1) begin
+                                        obs_ttl[oi] <= obs_ttl[oi] - 9'd1;
+                                    end else begin
+                                        obs_active[oi] <= 1'b0;
+                                        obs_ttl[oi] <= 9'd0;
+                                        expire_count = expire_count + 1;
+                                        for (oj = 0; oj < 3; oj = oj + 1) begin
+                                            for (ok = 0; ok < 3; ok = ok + 1) begin
+                                                if ((oj < obs_h[oi]) && (ok < obs_w[oi]))
+                                                    obstacle_map[cidx(obs_row[oi] + oj, obs_col[oi] + ok)] <= 1'b0;
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                            if (expire_count != 0)
+                                obstacle_count <= obstacle_count - expire_count;
+
+                            // Spawn temporary obstacles over time.
+                            if ((play_frame_cnt >= OBSTACLE_GRACE_FRAMES) &&
+                                (obstacle_spawn_cnt >= obstacle_spawn_period - 9'd1)) begin
+                                obstacle_spawn_cnt <= 9'd0;
+                                if (obstacle_count < obstacle_target) begin
+                                    // Stage-3: high levels permit larger shapes earlier.
+                                    if ((snake_len < 7'd10) && (obstacle_level < 3'd2)) begin
+                                        spawn_w = 2'd1;
+                                        spawn_h = 2'd1;
+                                    end else if ((snake_len < 7'd18) && (obstacle_level < 3'd3)) begin
+                                        if (lfsr[0]) begin
+                                            spawn_w = 2'd2;
+                                            spawn_h = 2'd1;
+                                        end else begin
+                                            spawn_w = 2'd1;
+                                            spawn_h = 2'd2;
+                                        end
+                                    end else begin
+                                        case (lfsr[2:1])
+                                            2'd0: begin spawn_w = 2'd2; spawn_h = 2'd2; end
+                                            2'd1: begin spawn_w = 2'd3; spawn_h = 2'd1; end
+                                            2'd2: begin spawn_w = 2'd1; spawn_h = 2'd3; end
+                                            default: begin spawn_w = 2'd3; spawn_h = 2'd2; end
+                                        endcase
+                                    end
+
+                                    spawn_ttl_rand = lfsr[5:0];
+                                    spawn_ttl = obstacle_lifetime_min + spawn_ttl_rand;
+                                    if (spawn_ttl > obstacle_lifetime_max)
+                                        spawn_ttl = obstacle_lifetime_max;
+
+                                    slot_found = 1'b0;
+                                    slot_idx   = 0;
+                                    for (oi = 0; oi < MAX_OBS; oi = oi + 1) begin
+                                        if (!slot_found && !obs_active[oi]) begin
+                                            slot_found = 1'b1;
+                                            slot_idx = oi;
+                                        end
+                                    end
+
+                                    spawn_valid = 1'b0;
+                                    if (slot_found) begin
+                                        // Stage-3: try up to 3 candidate positions each spawn window.
+                                        for (spawn_try = 0; spawn_try < 3; spawn_try = spawn_try + 1) begin
+                                            if (!spawn_valid) begin
+                                                case (spawn_try)
+                                                    0: begin
+                                                        try_col = spawn_col_raw;
+                                                        try_row = spawn_row_raw;
+                                                    end
+                                                    1: begin
+                                                        try_col = spawn_col_raw + 5'd7;
+                                                        try_row = spawn_row_raw + 4'd3;
+                                                    end
+                                                    default: begin
+                                                        try_col = spawn_col_raw + 5'd13;
+                                                        try_row = spawn_row_raw + 4'd5;
+                                                    end
+                                                endcase
+
+                                                spawn_col = (try_col < (GRID_COLS - spawn_w + 5'd1)) ?
+                                                            try_col :
+                                                            (try_col - (GRID_COLS - spawn_w + 5'd1));
+                                                spawn_row = (try_row < (GRID_ROWS - spawn_h + 4'd1)) ?
+                                                            try_row :
+                                                            (try_row - (GRID_ROWS - spawn_h + 4'd1));
+
+                                                spawn_valid = 1'b1;
+                                                for (oj = 0; oj < 3; oj = oj + 1) begin
+                                                    for (ok = 0; ok < 3; ok = ok + 1) begin
+                                                        if ((oj < spawn_h) && (ok < spawn_w)) begin
+                                                            if (body_map[cidx(spawn_row + oj, spawn_col + ok)])
+                                                                spawn_valid = 1'b0;
+                                                            if (obstacle_map[cidx(spawn_row + oj, spawn_col + ok)])
+                                                                spawn_valid = 1'b0;
+                                                            if (food_active && (food_row == (spawn_row + oj)) &&
+                                                                (food_col == (spawn_col + ok)))
+                                                                spawn_valid = 1'b0;
+                                                            // Stage-2/3 safety halo around head.
+                                                            if ((abs5(spawn_col + ok, head_col) <= head_safe_cells) &&
+                                                                (abs4(spawn_row + oj, head_row) <= head_safe_cells[2:0]))
+                                                                spawn_valid = 1'b0;
+                                                        end
+                                                    end
+                                                end
+                                            end
+                                        end
+                                    end
+
+                                    if (spawn_valid) begin
+                                        obs_active[slot_idx] <= 1'b1;
+                                        obs_col[slot_idx] <= spawn_col;
+                                        obs_row[slot_idx] <= spawn_row;
+                                        obs_w[slot_idx] <= spawn_w;
+                                        obs_h[slot_idx] <= spawn_h;
+                                        obs_ttl[slot_idx] <= spawn_ttl;
+                                        obstacle_count <= obstacle_count + 4'd1;
+                                        for (oj = 0; oj < 3; oj = oj + 1) begin
+                                            for (ok = 0; ok < 3; ok = ok + 1) begin
+                                                if ((oj < spawn_h) && (ok < spawn_w))
+                                                    obstacle_map[cidx(spawn_row + oj, spawn_col + ok)] <= 1'b1;
+                                            end
+                                        end
+                                    end
+                                end
+                            end else begin
+                                obstacle_spawn_cnt <= obstacle_spawn_cnt + 9'd1;
+                            end
+
                             // 60 frame ticks ~= 1 second at 60 Hz
                             if (sec_frame_cnt == 6'd59) begin
                                 sec_frame_cnt <= 6'd0;
@@ -419,7 +678,7 @@ module snake_top (
                             frame_cnt <= frame_cnt + 4'd1;
                             if (frame_cnt == move_speed - 4'd1) begin
                                 frame_cnt <= 4'd0;
-                                if (hit_body) begin
+                                if (hit_body || hit_obstacle) begin
                                     last_score <= score;
                                     game_state <= ST_GAME_OVER;
                                     paused <= 1'b0;
@@ -441,7 +700,8 @@ module snake_top (
                                 end
                             end
 
-                            if (!food_active && !body_map[cidx(fc_row, fc_col)]) begin
+                            if (!food_active && !body_map[cidx(fc_row, fc_col)] &&
+                                !obstacle_map[cidx(fc_row, fc_col)]) begin
                                 food_row    <= fc_row;
                                 food_col    <= fc_col;
                                 food_active <= 1'b1;
@@ -475,6 +735,7 @@ module snake_top (
     wire is_head = (cur_col == head_col) && (cur_row == head_row);
     wire is_body = body_map[cur_cidx] && !is_head;
     wire is_food = food_active && (cur_col == food_col) && (cur_row == food_row);
+    wire is_obstacle = obstacle_map[cur_cidx];
     wire flash_on = flash_cnt[4];
 
     // --- Compact HUD (top-left): S###  B###  TMM:SS ---
@@ -595,6 +856,7 @@ module snake_top (
                 ST_PLAYING: begin
                     if (is_head)      begin pix_r = 5'b00000; pix_g = 6'b111111; pix_b = 5'b00000; end
                     else if (is_body) begin pix_r = 5'b00000; pix_g = 6'b011000; pix_b = 5'b00000; end
+                    else if (is_obstacle) begin pix_r = 5'b11111; pix_g = 6'b101000; pix_b = 5'b00000; end
                     else if (is_food) begin pix_r = 5'b11111; pix_g = 6'b000000; pix_b = 5'b00000; end
                     else              begin pix_r = 5'b00000; pix_g = 6'b000000; pix_b = 5'b00000; end
                 end
